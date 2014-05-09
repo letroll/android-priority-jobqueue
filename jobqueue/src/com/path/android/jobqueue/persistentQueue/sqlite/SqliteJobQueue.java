@@ -44,6 +44,7 @@ public class SqliteJobQueue implements JobQueue {
         this.jobSerializer = jobSerializer;
         readyJobsQueryCache = new QueryCache();
         nextJobsQueryCache = new QueryCache();
+        sqlHelper.resetDelayTimesTo(JobManager.NOT_DELAYED_JOB_DELAY);
     }
 
     /**
@@ -162,6 +163,25 @@ public class SqliteJobQueue implements JobQueue {
      * {@inheritDoc}
      */
     @Override
+    public JobHolder findJobById(long id) {
+        Cursor cursor = db.rawQuery(sqlHelper.FIND_BY_ID_QUERY, new String[]{Long.toString(id)});
+        try {
+            if(!cursor.moveToFirst()) {
+                return null;
+            }
+            return createJobHolderFromCursor(cursor);
+        } catch (InvalidBaseJobException e) {
+            JqLog.e(e, "invalid job on findJobById");
+            return null;
+        } finally {
+            cursor.close();
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
     public JobHolder nextJobAndIncRunCount(boolean hasNetwork, Collection<String> excludeGroups) {
         //we can even keep these prepared but not sure the cost of them in db layer
         String selectQuery = nextJobsQueryCache.get(hasNetwork, excludeGroups);
@@ -245,6 +265,9 @@ public class SqliteJobQueue implements JobQueue {
         }
     }
 
+    /**
+     * {@inheritDoc}
+     */
     @Override
     public void clear() {
         sqlHelper.truncate();

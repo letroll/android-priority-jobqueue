@@ -3,6 +3,7 @@ package com.path.android.jobqueue.test.jobmanager;
 import android.content.Context;
 import com.path.android.jobqueue.JobHolder;
 import com.path.android.jobqueue.JobManager;
+import com.path.android.jobqueue.Params;
 import com.path.android.jobqueue.config.Configuration;
 import com.path.android.jobqueue.executor.JobConsumerExecutor;
 import com.path.android.jobqueue.network.NetworkEventProvider;
@@ -31,10 +32,36 @@ public class JobManagerTestBase extends TestBase {
 
 
 
+    protected static class DummyTwoLatchJob extends DummyJob {
+        private final CountDownLatch waitFor;
+        private final CountDownLatch trigger;
+        private final CountDownLatch onRunLatch;
+
+        protected DummyTwoLatchJob(Params params, CountDownLatch waitFor, CountDownLatch trigger) {
+            super(params);
+            this.waitFor = waitFor;
+            this.trigger = trigger;
+            onRunLatch = new CountDownLatch(1);
+        }
+
+        public void waitTillOnRun() throws InterruptedException {
+            onRunLatch.await();
+        }
+
+        @Override
+        public void onRun() throws Throwable {
+            onRunLatch.countDown();
+            waitFor.await();
+            super.onRun();
+            trigger.countDown();
+        }
+    }
+
     protected static class DummyLatchJob extends DummyJob {
         private final CountDownLatch latch;
 
-        protected DummyLatchJob(CountDownLatch latch) {
+        protected DummyLatchJob(Params params, CountDownLatch latch) {
+            super(params);
             this.latch = latch;
         }
 
@@ -49,7 +76,7 @@ public class JobManagerTestBase extends TestBase {
     protected static class DummyJobWithRunCount extends DummyJob {
         public static int runCount;
         protected DummyJobWithRunCount(boolean persistent) {
-            super(false, persistent);
+            super(new Params(0).setPersistent(persistent));
         }
 
         @Override
@@ -106,6 +133,10 @@ public class JobManagerTestBase extends TestBase {
         public void setListener(Listener listener) {
             this.listener = listener;
         }
+
+        public boolean isConnected() {
+            return hasNetwork;
+        }
     }
 
     protected static class ObjectReference {
@@ -139,7 +170,8 @@ public class JobManagerTestBase extends TestBase {
     public static class NeverEndingDummyJob extends DummyJob {
         final Object lock;
         final Semaphore semaphore;
-        public NeverEndingDummyJob(Object lock, Semaphore semaphore) {
+        public NeverEndingDummyJob(Params params, Object lock, Semaphore semaphore) {
+            super(params);
             this.lock = lock;
             this.semaphore = semaphore;
         }

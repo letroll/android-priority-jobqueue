@@ -11,6 +11,7 @@ import com.path.android.jobqueue.network.NetworkUtil;
 import com.path.android.jobqueue.nonPersistentQueue.NonPersistentPriorityQueue;
 import com.path.android.jobqueue.persistentQueue.sqlite.SqliteJobQueue;
 
+import java.util.Collection;
 import java.util.concurrent.*;
 
 /**
@@ -40,6 +41,7 @@ public class JobManager implements NetworkEventProvider.Listener {
     private final ConcurrentHashMap<Long, CountDownLatch> persistentOnAddedLocks;
     private final ConcurrentHashMap<Long, CountDownLatch> nonPersistentOnAddedLocks;
     private final ScheduledExecutorService timedExecutor;
+    private final Object getNextJobLock = new Object();
 
     /**
      * Default constructor that will create a JobManager with 1 {@link SqliteJobQueue} and 1 {@link NonPersistentPriorityQueue}
@@ -136,87 +138,28 @@ public class JobManager implements NetworkEventProvider.Listener {
     }
 
     /**
-     * Adds a job with given priority and returns the JobId.
-     * @param priority Higher runs first
-     * @param baseJob The actual job to run
-     * @return job id
+     * Adds a new Job to the list and returns an ID for it.
+     * @param job to add
+     * @return id for the job.
      */
-    public long addJob(int priority, BaseJob baseJob) {
-        return addJob(priority, 0, baseJob);
-    }
-
-    /**
-     * Adds a job with given priority and returns the JobId.
-     * @param priority Higher runs first
-     * @param delay number of milliseconds that this job should be delayed
-     * @param baseJob The actual job to run
-     * @return a job id. is useless for now but we'll use this to cancel jobs in the future.
-     */
-    public long addJob(int priority, long delay, BaseJob baseJob) {
-        JobHolder jobHolder = new JobHolder(priority, baseJob, delay > 0 ? System.nanoTime() + delay * NS_PER_MS : NOT_DELAYED_JOB_DELAY, NOT_RUNNING_SESSION_ID);
-        long id;
-        if (baseJob.isPersistent()) {
-            synchronized (persistentJobQueue) {
-                id = persistentJobQueue.insert(jobHolder);
-                addOnAddedLock(persistentOnAddedLocks, id);
-            }
-        } else {
-            synchronized (nonPersistentJobQueue) {
-                id = nonPersistentJobQueue.insert(jobHolder);
-                addOnAddedLock(nonPersistentOnAddedLocks, id);
-            }
-        }
-        if(JqLog.isDebugEnabled()) {
-            JqLog.d("added job id: %d class: %s priority: %d delay: %d group : %s persistent: %s requires network: %s"
-                    , id, baseJob.getClass().getSimpleName(), priority, delay, baseJob.getRunGroupId()
-                    , baseJob.isPersistent(), baseJob.requiresNetwork());
-        }
-        if(dependencyInjector != null) {
-            //inject members b4 calling onAdded
-            dependencyInjector.inject(baseJob);
-        }
-        jobHolder.getBaseJob().onAdded();
-        if(baseJob.isPersistent()) {
-            synchronized (persistentJobQueue) {
-                clearOnAddedLock(persistentOnAddedLocks, id);
-            }
-        } else {
-            synchronized (nonPersistentJobQueue) {
-                clearOnAddedLock(nonPersistentOnAddedLocks, id);
-            }
-        }
-        notifyJobConsumer();
-        return id;
+    public long addJob(Job job) {
+        //noinspection deprecation
+        return addJob(job.getPriority(), job.getDelayInMs(), job);
     }
 
     /**
      * Non-blocking convenience method to add a job in background thread.
+     * @see #addJob(Job)
+     * @param job job to add
      *
-     * @see #addJob(int, BaseJob) addJob(priority, job).
      */
-    public void addJobInBackground(final int priority, final BaseJob baseJob) {
-        timedExecutor.execute(new Runnable() {
-            @Override
-            public void run() {
-                addJob(priority, baseJob);
-            }
-        });
+    public void addJobInBackground(Job job) {
+        //noinspection deprecation
+        addJobInBackground(job.getPriority(), job.getDelayInMs(), job);
     }
 
-    /**
-     * Non-blocking convenience method to add a job in background thread.
-     *
-     * @see #addJob(int, long, BaseJob) addJob(priority, delay, job).
-     */
-    public void addJobInBackground(final int priority, final long delay, final BaseJob baseJob) {
-        final long callTime = System.nanoTime();
-        timedExecutor.execute(new Runnable() {
-            @Override
-            public void run() {
-                final long runDelay = (System.nanoTime() - callTime) / NS_PER_MS;
-                addJob(priority, Math.max(0, delay - runDelay), baseJob);
-            }
-        });
+    public void addJobInBackground(Job job, /*nullable*/ AsyncAddCallback callback) {
+        addJobInBackground(job.getPriority(), job.getDelayInMs(), job, callback);
     }
 
     //need to sync on related job queue before calling this
@@ -319,30 +262,36 @@ public class JobManager implements NetworkEventProvider.Listener {
         boolean haveNetwork = hasNetwork();
         JobHolder jobHolder;
         boolean persistent = false;
-        synchronized (nonPersistentJobQueue) {
-            jobHolder = nonPersistentJobQueue.nextJobAndIncRunCount(haveNetwork, runningJobGroups.getSafe());
-        }
-        if (jobHolder == null) {
-            //go to disk, there aren't any non-persistent jobs
-            synchronized (persistentJobQueue) {
-                jobHolder = persistentJobQueue.nextJobAndIncRunCount(haveNetwork, runningJobGroups.getSafe());
-                persistent = true;
+        synchronized (getNextJobLock) {
+            final Collection<String> runningJobIds = runningJobGroups.getSafe();
+            synchronized (nonPersistentJobQueue) {
+                jobHolder = nonPersistentJobQueue.nextJobAndIncRunCount(haveNetwork, runningJobIds);
+            }
+            if (jobHolder == null) {
+                //go to disk, there aren't any non-persistent jobs
+                synchronized (persistentJobQueue) {
+                    jobHolder = persistentJobQueue.nextJobAndIncRunCount(haveNetwork, runningJobIds);
+                    persistent = true;
+                }
+            }
+            if(jobHolder == null) {
+                return null;
+            }
+            if(persistent && dependencyInjector != null) {
+                dependencyInjector.inject(jobHolder.getBaseJob());
+            }
+            if(jobHolder.getGroupId() != null) {
+                runningJobGroups.add(jobHolder.getGroupId());
             }
         }
-        if(jobHolder != null) {
-            //wait for onAdded locks
-            if(persistent) {
-                waitForOnAddedLock(persistentOnAddedLocks, jobHolder.getId());
-            } else {
-                waitForOnAddedLock(nonPersistentOnAddedLocks, jobHolder.getId());
-            }
+
+        //wait for onAdded locks. wait for locks after job is selected so that we minimize the lock
+        if(persistent) {
+            waitForOnAddedLock(persistentOnAddedLocks, jobHolder.getId());
+        } else {
+            waitForOnAddedLock(nonPersistentOnAddedLocks, jobHolder.getId());
         }
-        if(persistent && jobHolder != null && dependencyInjector != null) {
-            dependencyInjector.inject(jobHolder.getBaseJob());
-        }
-        if(jobHolder != null && jobHolder.getGroupId() != null) {
-            runningJobGroups.add(jobHolder.getGroupId());
-        }
+
         return jobHolder;
     }
 
@@ -360,6 +309,48 @@ public class JobManager implements NetworkEventProvider.Listener {
         if(jobHolder.getGroupId() != null) {
             runningJobGroups.remove(jobHolder.getGroupId());
         }
+    }
+
+    /**
+     * Returns the current status of a {@link Job}.
+     * <p>
+     *     You should not call this method on the UI thread because it may make a db request.
+     * </p>
+     * <p>
+     *     This is not a very fast call so try not to make it unless necessary. Consider using events if you need to be
+     *     informed about a job's lifecycle.
+     * </p>
+     * @param id the ID, returned by the addJob method
+     * @param isPersistent Jobs are added to different queues depending on if they are persistent or not. This is necessary
+     *                     because each queue has independent id sets.
+     * @return
+     */
+    public JobStatus getJobStatus(long id, boolean isPersistent) {
+        if(jobConsumerExecutor.isRunning(id, isPersistent)) {
+            return JobStatus.RUNNING;
+        }
+        JobHolder holder;
+        if(isPersistent) {
+            synchronized (persistentJobQueue) {
+                holder = persistentJobQueue.findJobById(id);
+            }
+        } else {
+            synchronized (nonPersistentJobQueue) {
+                holder = nonPersistentJobQueue.findJobById(id);
+            }
+        }
+        if(holder == null) {
+            return JobStatus.UNKNOWN;
+        }
+        boolean network = hasNetwork();
+        if(holder.requiresNetwork() && !network) {
+            return JobStatus.WAITING_NOT_READY;
+        }
+        if(holder.getDelayUntilNs() > System.nanoTime()) {
+            return JobStatus.WAITING_NOT_READY;
+        }
+
+        return JobStatus.WAITING_READY;
     }
 
     private void removeJob(JobHolder jobHolder) {
@@ -476,6 +467,112 @@ public class JobManager implements NetworkEventProvider.Listener {
             return countReadyJobs(networkUtil instanceof NetworkEventProvider ? hasNetwork() : true);
         }
     };
+
+    /**
+     * Deprecated, please use {@link #addJob(Job)}.
+     *
+     * <p>Adds a job with given priority and returns the JobId.</p>
+     * @param priority Higher runs first
+     * @param baseJob The actual job to run
+     * @return job id
+     */
+    @Deprecated
+    public long addJob(int priority, BaseJob baseJob) {
+        return addJob(priority, 0, baseJob);
+    }
+
+    /**
+     * Deprecated, please use {@link #addJob(Job)}.
+     *
+     * <p>Adds a job with given priority and returns the JobId.</p>
+     * @param priority Higher runs first
+     * @param delay number of milliseconds that this job should be delayed
+     * @param baseJob The actual job to run
+     * @return a job id. is useless for now but we'll use this to cancel jobs in the future.
+     */
+    @Deprecated
+    public long addJob(int priority, long delay, BaseJob baseJob) {
+        JobHolder jobHolder = new JobHolder(priority, baseJob, delay > 0 ? System.nanoTime() + delay * NS_PER_MS : NOT_DELAYED_JOB_DELAY, NOT_RUNNING_SESSION_ID);
+        long id;
+        if (baseJob.isPersistent()) {
+            synchronized (persistentJobQueue) {
+                id = persistentJobQueue.insert(jobHolder);
+                addOnAddedLock(persistentOnAddedLocks, id);
+            }
+        } else {
+            synchronized (nonPersistentJobQueue) {
+                id = nonPersistentJobQueue.insert(jobHolder);
+                addOnAddedLock(nonPersistentOnAddedLocks, id);
+            }
+        }
+        if(JqLog.isDebugEnabled()) {
+            JqLog.d("added job id: %d class: %s priority: %d delay: %d group : %s persistent: %s requires network: %s"
+                    , id, baseJob.getClass().getSimpleName(), priority, delay, baseJob.getRunGroupId()
+                    , baseJob.isPersistent(), baseJob.requiresNetwork());
+        }
+        if(dependencyInjector != null) {
+            //inject members b4 calling onAdded
+            dependencyInjector.inject(baseJob);
+        }
+        jobHolder.getBaseJob().onAdded();
+        if(baseJob.isPersistent()) {
+            synchronized (persistentJobQueue) {
+                clearOnAddedLock(persistentOnAddedLocks, id);
+            }
+        } else {
+            synchronized (nonPersistentJobQueue) {
+                clearOnAddedLock(nonPersistentOnAddedLocks, id);
+            }
+        }
+        notifyJobConsumer();
+        return id;
+    }
+
+    /**
+     * Please use {@link #addJobInBackground(Job)}.
+     * <p>Non-blocking convenience method to add a job in background thread.</p>
+     *
+     * @see #addJob(int, BaseJob) addJob(priority, job).
+     */
+    @Deprecated
+    public void addJobInBackground(final int priority, final BaseJob baseJob) {
+        timedExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                addJob(priority, baseJob);
+            }
+        });
+    }
+
+    /**
+     * Deprecated, please use {@link #addJobInBackground(Job)}.
+     * <p></p>Non-blocking convenience method to add a job in background thread.</p>
+     * @see #addJob(int, long, BaseJob) addJob(priority, delay, job).
+     */
+    @Deprecated
+    public void addJobInBackground(final int priority, final long delay, final BaseJob baseJob) {
+        addJobInBackground(priority, delay, baseJob, null);
+    }
+
+    protected void addJobInBackground(final int priority, final long delay, final BaseJob baseJob,
+        /*nullable*/final AsyncAddCallback callback) {
+        final long callTime = System.nanoTime();
+        timedExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    final long runDelay = (System.nanoTime() - callTime) / NS_PER_MS;
+                    long id = addJob(priority, Math.max(0, delay - runDelay), baseJob);
+                    if(callback != null) {
+                        callback.onAdded(id);
+                    }
+                } catch (Throwable t) {
+                    JqLog.e(t, "addJobInBackground received an exception. job class: %s", baseJob.getClass().getSimpleName() );
+                }
+            }
+        });
+    }
+
 
     /**
      * Default implementation of QueueFactory that creates one {@link SqliteJobQueue} and one {@link NonPersistentPriorityQueue}
